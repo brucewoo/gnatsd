@@ -4,9 +4,7 @@ package server
 
 import (
 	"fmt"
-
 	"io/ioutil"
-	"net/url"
 	"strings"
 	"time"
 
@@ -33,20 +31,26 @@ type Options struct {
 	AuthTimeout        float64       `json:"auth_timeout"`
 	MaxControlLine     int           `json:"max_control_line"`
 	MaxPayload         int           `json:"max_payload"`
-	ClusterHost        string        `json:"addr"`
-	ClusterPort        int           `json:"port"`
-	ClusterUsername    string        `json:"-"`
-	ClusterPassword    string        `json:"-"`
-	ClusterAuthTimeout float64       `json:"auth_timeout"`
-	Routes             []*url.URL    `json:"-"`
+	ZkAddrs        	   []string      `json:"addr"`
+	ZkPath        	   string        `json:"path"`
+	ZkTimeout 		   float64       `json:"zk_timeout"`
+	RouteHost          string        `json:"route_addr"`
+	RoutePort          int           `json:"route_port"`
 	ProfPort           int           `json:"-"`
 	PidFile            string        `json:"-"`
 	LogFile            string        `json:"-"`
+	MaxProcs		   int			 `json:"go_max_procs"`
 }
 
 type authorization struct {
 	user    string
 	pass    string
+	timeout float64
+}
+
+type zkinfo struct {
+	addr    string
+	path    string
 	timeout float64
 }
 
@@ -98,6 +102,8 @@ func ProcessConfigFile(configFile string) (*Options, error) {
 			opts.LogFile = v.(string)
 		case "pidfile", "pid_file":
 			opts.PidFile = v.(string)
+		case "go_max_procs":
+			opts.MaxProcs = int(v.(int64))
 		}
 	}
 	return opts, nil
@@ -107,27 +113,16 @@ func ProcessConfigFile(configFile string) (*Options, error) {
 func parseCluster(cm map[string]interface{}, opts *Options) error {
 	for mk, mv := range cm {
 		switch strings.ToLower(mk) {
-		case "port":
-			opts.ClusterPort = int(mv.(int64))
-		case "host", "net":
-			opts.ClusterHost = mv.(string)
-		case "authorization":
+		case "zkinfo":
 			am := mv.(map[string]interface{})
-			auth := parseAuthorization(am)
-			opts.ClusterUsername = auth.user
-			opts.ClusterPassword = auth.pass
-			opts.ClusterAuthTimeout = auth.timeout
-		case "routes":
-			ra := mv.([]interface{})
-			opts.Routes = make([]*url.URL, 0, len(ra))
-			for _, r := range ra {
-				routeURL := r.(string)
-				url, err := url.Parse(routeURL)
-				if err != nil {
-					return fmt.Errorf("error parsing route url [%q]", routeURL)
-				}
-				opts.Routes = append(opts.Routes, url)
-			}
+			zkinfo := parseZkinfo(am)
+			opts.ZkAddrs = strings.Split(zkinfo.addr, ",")
+			opts.ZkPath = zkinfo.path
+			opts.ZkTimeout = zkinfo.timeout
+		case "route_port":
+			opts.RoutePort = int(mv.(int64))
+		case "route_host":
+			opts.RouteHost = mv.(string)
 		}
 	}
 	return nil
@@ -154,6 +149,29 @@ func parseAuthorization(am map[string]interface{}) authorization {
 		}
 	}
 	return auth
+}
+
+// Helper function to parse zkinfo configs.
+func parseZkinfo(am map[string]interface{}) zkinfo {
+	zk := zkinfo{}
+	for mk, mv := range am {
+		switch strings.ToLower(mk) {
+		case "addr":
+			zk.addr = mv.(string)
+		case "path":
+			zk.path = mv.(string)
+		case "timeout":
+			at := float64(1)
+			switch mv.(type) {
+			case int64:
+				at = float64(mv.(int64))
+			case float64:
+				at = mv.(float64)
+			}
+			zk.timeout = at
+		}
+	}
+	return zk
 }
 
 // MergeOptions will merge two options giving preference to the flagOpts
@@ -224,13 +242,16 @@ func processOptions(opts *Options) {
 	if opts.AuthTimeout == 0 {
 		opts.AuthTimeout = float64(AUTH_TIMEOUT) / float64(time.Second)
 	}
-	if opts.ClusterAuthTimeout == 0 {
-		opts.ClusterAuthTimeout = float64(AUTH_TIMEOUT) / float64(time.Second)
-	}
 	if opts.MaxControlLine == 0 {
 		opts.MaxControlLine = MAX_CONTROL_LINE_SIZE
 	}
 	if opts.MaxPayload == 0 {
 		opts.MaxPayload = MAX_PAYLOAD_SIZE
+	}
+	if opts.RouteHost == "" {
+		opts.RouteHost = DEFAULT_HOST
+	}
+	if opts.MaxProcs == 0 {
+		opts.MaxProcs = DEFAULT_MAX_PROCS
 	}
 }

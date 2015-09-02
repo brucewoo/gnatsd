@@ -10,11 +10,11 @@ import (
 	"net/url"
 	"regexp"
 	"time"
+	"strings"
 )
 
 type route struct {
 	remoteID   string
-	didSolicit bool
 	url        *url.URL
 }
 
@@ -58,6 +58,7 @@ func (c *client) sendConnect() {
 // and large subscription space. Plus buffering in place not a good idea.
 func (s *Server) sendLocalSubsToRoute(route *client) {
 	b := bytes.Buffer{}
+	hasSentSubs := make(map[string]bool)
 
 	s.mu.Lock()
 	for _, client := range s.clients {
@@ -65,26 +66,45 @@ func (s *Server) sendLocalSubsToRoute(route *client) {
 		subs := client.subs.All()
 		client.mu.Unlock()
 		for _, s := range subs {
-			if sub, ok := s.(*subscription); ok {
-				rsid := routeSid(sub)
-				proto := fmt.Sprintf(subProto, sub.subject, sub.queue, rsid)
-				b.WriteString(proto)
+			if sub, ok := s.(*subscription); ok && sub.client.typ != ROUTER {
+				//如果一个主题已经被发送过了就不需要在发送了，减少订阅信息
+				_, exist := hasSentSubs[string(sub.subject)]
+				if !exist {
+					hasSentSubs[string(sub.subject)] = true
+					rsid := routeSid(sub)
+					proto := fmt.Sprintf(subProto, sub.subject, sub.queue, rsid)
+					b.WriteString(proto)
+					Logf("%s  send to other route success.", string(sub.subject))
+				} else {
+					Logf("%s has sent to other route.", string(sub.subject))
+				}
 			}
 		}
 	}
 	s.mu.Unlock()
 
 	route.mu.Lock()
-	defer route.mu.Unlock()
-	route.bw.Write(b.Bytes())
-	route.bw.Flush()
-
-	Debug("Route sent local subscriptions", route.cid)
+	ip, port := route.ConnStr()
+	_, err := route.bw.Write(b.Bytes())
+	if err != nil {
+		route.mu.Unlock()
+		Logf("Write:Route sent local subscriptions to connect route[%s:%s/%d] failed.", ip, port, route.cid)
+		route.closeConnection()
+		return 
+	}
+	err = route.bw.Flush()
+	if err != nil {
+		route.mu.Unlock()
+		Logf("Flush:Route sent local subscriptions to connect route[%s:%s/%d] failed.", ip, port, route.cid)
+		route.closeConnection()
+		return
+	} 
+	route.mu.Unlock()
+	Logf("Route sent local subscriptions to connect route[%s:%s/%d] success.", ip, port, route.cid)
 }
 
 func (s *Server) createRoute(conn net.Conn, rURL *url.URL) *client {
-	didSolicit := rURL != nil
-	r := &route{didSolicit: didSolicit}
+	r := &route{}
 	c := &client{srv: s, nc: conn, opts: clientOpts{}, typ: ROUTER, route: r}
 
 	// Grab lock
@@ -93,10 +113,10 @@ func (s *Server) createRoute(conn net.Conn, rURL *url.URL) *client {
 	// Initialize
 	c.initClient()
 
-	Debug("Route connection created", clientConnStr(c.nc), c.cid)
+	Log("Route connection created ", clientConnStr(c.nc), c.cid)
 
 	// Queue Connect proto if we solicited the connection.
-	if didSolicit {
+	if rURL != nil {
 		r.url = rURL
 		Debug("Route connect msg sent", clientConnStr(c.nc), c.cid)
 		c.sendConnect()
@@ -106,8 +126,8 @@ func (s *Server) createRoute(conn net.Conn, rURL *url.URL) *client {
 	s.sendInfo(c)
 
 	// Check for Auth required state for incoming connections.
-	if s.routeInfo.AuthRequired && !didSolicit {
-		ttl := secondsToDuration(s.opts.ClusterAuthTimeout)
+	if s.routeInfo.AuthRequired {
+		ttl := secondsToDuration(s.opts.AuthTimeout)
 		c.setAuthTimer(ttl)
 	}
 
@@ -151,24 +171,24 @@ const (
 // FIXME(dlc) - This may be too slow, check at later date.
 var qrsidRe = regexp.MustCompile(`QRSID:(\d+):([^\s]+)`)
 
-func (s *Server) routeSidQueueSubscriber(rsid []byte) *subscription {
+func (s *Server) routeSidQueueSubscriber(rsid []byte) (*subscription, bool){
 	if !bytes.HasPrefix(rsid, []byte(QRSID)) {
-		return nil
+		return nil, false
 	}
 	matches := qrsidRe.FindSubmatch(rsid)
 	if matches == nil || len(matches) != EXPECTED_MATCHES {
-		return nil
+		return nil, false
 	}
 	cid := uint64(parseInt64(matches[RSID_CID_INDEX]))
 	client := s.clients[cid]
 	if client == nil {
-		return nil
+		return nil, true
 	}
 	sid := matches[RSID_SID_INDEX]
 	if sub, ok := (client.subs.Get(sid)).(*subscription); ok {
-		return sub
+		return sub, true
 	}
-	return nil
+	return nil, true
 }
 
 func routeSid(sub *subscription) string {
@@ -186,40 +206,60 @@ func (s *Server) isDuplicateRemote(id string) bool {
 	return ok
 }
 
-func (s *Server) broadcastToRoutes(proto string) {
+func (s *Server) broadcastToRoutes(proto string) error {
+	var err error
+	
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	for _, route := range s.routes {
 		// FIXME(dlc) - Make same logic as deliverMsg
+		ip, port := route.ConnStr()
+		if len(ip) < 8 {
+			continue
+		}
 		route.mu.Lock()
-		route.bw.WriteString(proto)
-		route.bw.Flush()
+		_, err = route.bw.WriteString(proto)
+		if err != nil {
+			Logf("broadcast to route subscriptions to [%s:%s/%d] failed, WriteString failed.", ip, port, route.cid)
+		} else {
+			err = route.bw.Flush()
+			if err != nil {
+				Logf("broadcast to route subscriptions to [%s:%s/%d] failed, WriteString failed.", ip, port, route.cid)
+			}
+		}
 		route.mu.Unlock()
+		
+		if err != nil {
+			break
+		} else {
+			Logf("broadcast to route subscriptions to [%s:%s/%d][%s] success.", ip, port, route.cid, proto)
+		}
 	}
-	s.mu.Unlock()
+	return err
 }
 
 // broadcastSubscribe will forward a client subscription
 // to all active routes.
-func (s *Server) broadcastSubscribe(sub *subscription) {
+func (s *Server) broadcastSubscribe(sub *subscription) error {
 	rsid := routeSid(sub)
 	proto := fmt.Sprintf(subProto, sub.subject, sub.queue, rsid)
-	s.broadcastToRoutes(proto)
+	return s.broadcastToRoutes(proto)
 }
 
 // broadcastUnSubscribe will forward a client unsubscribe
 // action to all active routes.
-func (s *Server) broadcastUnSubscribe(sub *subscription) {
+func (s *Server) broadcastUnSubscribe(sub *subscription) error {
 	rsid := routeSid(sub)
 	maxStr := _EMPTY_
 	if sub.max > 0 {
 		maxStr = fmt.Sprintf("%d ", sub.max)
 	}
 	proto := fmt.Sprintf(unsubProto, maxStr, rsid)
-	s.broadcastToRoutes(proto)
+	return s.broadcastToRoutes(proto)
 }
 
 func (s *Server) routeAcceptLoop(ch chan struct{}) {
-	hp := fmt.Sprintf("%s:%d", s.opts.ClusterHost, s.opts.ClusterPort)
+	hp := fmt.Sprintf("%s:%d", s.opts.RouteHost, s.opts.RoutePort)
 	Logf("Listening for route connections on %s", hp)
 	l, e := net.Listen("tcp", hp)
 	if e != nil {
@@ -254,7 +294,19 @@ func (s *Server) routeAcceptLoop(ch chan struct{}) {
 			continue
 		}
 		tmpDelay = ACCEPT_MIN_SLEEP
-		s.createRoute(conn, nil)
+		
+		routeURL := "nats-route://" + s.opts.Username + ":" + s.opts.Password + "@"
+		if ip, ok := conn.(*net.TCPConn); ok {
+			addr := ip.RemoteAddr().(*net.TCPAddr)
+			routeURL += addr.String()
+			Logf("%s", routeURL)
+			rUrl, err := url.Parse(routeURL)
+			if err != nil {
+	  			Logf("error parsing route url [%q]", routeURL)
+	  			continue
+	  		}
+			s.createRoute(conn, rUrl)
+		}
 	}
 	Debug("Router accept loop exiting..")
 	s.done <- true
@@ -266,14 +318,14 @@ func (s *Server) StartRouting() {
 	info := Info{
 		ID:           s.info.ID,
 		Version:      s.info.Version,
-		Host:         s.opts.ClusterHost,
-		Port:         s.opts.ClusterPort,
+		Host:         s.opts.RouteHost,
+		Port:         s.opts.RoutePort,
 		AuthRequired: false,
 		SslRequired:  false,
 		MaxPayload:   MAX_PAYLOAD_SIZE,
 	}
 	// Check for Auth items
-	if s.opts.ClusterUsername != "" {
+	if s.opts.Username != "" {
 		info.AuthRequired = true
 	}
 	s.routeInfo = info
@@ -288,19 +340,33 @@ func (s *Server) StartRouting() {
 	ch := make(chan struct{})
 	go s.routeAcceptLoop(ch)
 	<-ch
-
-	// Solicit Routes if needed.
-	s.solicitRoutes()
 }
 
-func (s *Server) reConnectToRoute(rUrl *url.URL) {
-	time.Sleep(DEFAULT_ROUTE_RECONNECT)
-	s.connectToRoute(rUrl)
-}
-
-func (s *Server) connectToRoute(rUrl *url.URL) {
+func (s *Server) connectToRoute(nodepath string) {
+	tmps := strings.Split(nodepath, "-")
+	if len(tmps) < 3 {
+		return
+	}
+	routeURL := "nats-route://" + tmps[0] + ":" + tmps[2]
+	rUrl, err := url.Parse(routeURL)
+	if err != nil {
+  		Logf("error parsing route url [%q]", routeURL)
+  		return
+    }
+	
 	for s.isRunning() {
-		Debugf("Trying to connect to route on %s", rUrl.Host)
+		b, _,  err := s.zkClient.Exists(s.opts.ZkPath + "/" + nodepath)
+		if err != nil {
+			Logf("zkclient Exists [%s] failed.", nodepath)
+			continue
+		}
+		
+		if !b {
+			Logf("[%s] is not Exists, exit connectToRoute.", nodepath)
+			return
+		}
+		
+		Logf("Trying to connect to route on %s", rUrl.Host)
 		conn, err := net.DialTimeout("tcp", rUrl.Host, DEFAULT_ROUTE_DIAL)
 		if err != nil {
 			Debugf("Error trying to connect to route: %v", err)
@@ -313,25 +379,18 @@ func (s *Server) connectToRoute(rUrl *url.URL) {
 		}
 		// We have a route connection here.
 		// Go ahead and create it and exit this func.
-		s.createRoute(conn, rUrl)
+		if ip, ok := conn.(*net.TCPConn); ok {
+			routeURL = "nats-route://" + s.opts.Username + ":" + s.opts.Password + "@"
+			addr := ip.RemoteAddr().(*net.TCPAddr)
+			routeURL += addr.String()
+			Logf("%s", routeURL)
+			rUrl, err = url.Parse(routeURL)
+			if err != nil {
+	  			Logf("error parsing route url [%q]", routeURL)
+	  		} else {
+				s.createRoute(conn, rUrl)
+			}
+		}
 		return
 	}
-}
-
-func (c *client) isSolicitedRoute() bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.typ == ROUTER && c.route != nil && c.route.didSolicit
-}
-
-func (s *Server) solicitRoutes() {
-	for _, r := range s.opts.Routes {
-		go s.connectToRoute(r)
-	}
-}
-
-func (s *Server) numRoutes() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return len(s.routes)
 }

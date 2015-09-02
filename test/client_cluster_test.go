@@ -16,8 +16,8 @@ func TestServerRestartReSliceIssue(t *testing.T) {
 	srvA, srvB, optsA, optsB := runServers(t)
 	defer srvA.Shutdown()
 
-	urlA := fmt.Sprintf("nats://%s:%d/", optsA.Host, optsA.Port)
-	urlB := fmt.Sprintf("nats://%s:%d/", optsB.Host, optsB.Port)
+	urlA := fmt.Sprintf("nats://nats:nats@%s:%d/", optsA.Host, optsA.Port)
+	urlB := fmt.Sprintf("nats://nats:nats@%s:%d/", optsB.Host, optsB.Port)
 
 	// msg to send..
 	msg := []byte("Hello World")

@@ -425,10 +425,11 @@ func matchLiteral(literal, subject []byte) bool {
 		}
 		li += 1
 	}
+	
 	// Make sure we have processed all of the literal's chars..
-	if li < (ll - 1) {
-		return false
-	}
+    if li < (ll - 1) {
+      return false
+    }
 	return true
 }
 

@@ -18,7 +18,7 @@ import (
 	"github.com/apcera/gnatsd/server"
 )
 
-const natsServerExe = "../gnatsd"
+const natsServerExe = "./bin/gnatsd"
 
 type natsServer struct {
 	args []string
@@ -170,7 +170,7 @@ func doConnect(t tLogger, c net.Conn, verbose, pedantic, ssl bool) {
 	if err != nil {
 		stackFatalf(t, "Could not unmarshal INFO json: %v\n", err)
 	}
-	cs := fmt.Sprintf("CONNECT {\"verbose\":%v,\"pedantic\":%v,\"ssl_required\":%v}\r\n", verbose, pedantic, ssl)
+	cs := fmt.Sprintf("CONNECT {\"User\":\"nats\",\"Pass\":\"nats\",\"verbose\":%v,\"pedantic\":%v,\"ssl_required\":%v}\r\n", verbose, pedantic, ssl)
 	sendProto(t, c, cs)
 }
 
@@ -204,8 +204,8 @@ func doRouteAuthConnect(t tLogger, c net.Conn, user, pass, id string) {
 }
 
 func setupRouteEx(t tLogger, c net.Conn, opts *server.Options, id string) (sendFun, expectFun) {
-	user := opts.ClusterUsername
-	pass := opts.ClusterPassword
+	user := opts.Username
+	pass := opts.Password
 	doRouteAuthConnect(t, c, user, pass, id)
 	send := sendCommand(t, c)
 	expect := expectCommand(t, c)

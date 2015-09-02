@@ -11,6 +11,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"strconv"
 
 	"github.com/apcera/gnatsd/hashmap"
 	"github.com/apcera/gnatsd/sublist"
@@ -93,6 +94,14 @@ func clientConnStr(conn net.Conn) interface{} {
 		return []string{fmt.Sprintf("%v, %d", addr.IP, addr.Port)}
 	}
 	return "N/A"
+}
+
+func (c *client) ConnStr() (ip, port string) {
+	if ip, ok := c.nc.(*net.TCPConn); ok {
+		addr := ip.RemoteAddr().(*net.TCPAddr)
+		return fmt.Sprintf("%v", addr.IP), strconv.Itoa(addr.Port)
+	}
+	return "", ""
 }
 
 // Lock should be held
@@ -204,7 +213,7 @@ func (c *client) processRouteInfo(info *Info) {
 	// Check to see if we have this remote already registered.
 	// This can happen when both servers have routes to each other.
 	if c.srv.isDuplicateRemote(info.ID) {
-		Debug("Detected duplicate remote route", info.ID, clientConnStr(c.nc), c.cid)
+		Log("Detected duplicate remote route", info.ID, clientConnStr(c.nc), c.cid)
 		c.closeConnection()
 	} else {
 		s := c.srv
@@ -444,12 +453,26 @@ func (c *client) processSub(argo []byte) (err error) {
 		return fmt.Errorf("processSub Parse Error: '%s'", arg)
 	}
 
+	hasSub := false
 	c.mu.Lock()
 	c.subs.Set(sub.sid, sub)
 	if c.srv != nil {
+		// 找到不需要转发的前提是已经有非route的客户端订阅过同样的消息
+		r := c.srv.sl.Match(sub.subject)
+		for _, v := range r {
+			sub := v.(*subscription)
+			if sub.client.typ != ROUTER {
+				hasSub = true
+				break
+			}
+		}
 		err = c.srv.sl.Insert(sub.subject, sub)
 	}
-	shouldForward := c.typ != ROUTER && c.srv != nil
+	
+	// 如果订阅的消息不是来至一个route（另一个服务器），那么需要把订阅信息转发到其他服务器
+	// 为了减少订阅信息，如果同一个主题已经被订阅过了那么也应该被转发过了就不需要转发了
+	// 也就是同一个主题只有第一个的被转发到其他服务器
+	shouldForward := c.typ != ROUTER && c.srv != nil && (!hasSub || sub.queue != nil)
 	c.mu.Unlock()
 	if err != nil {
 		c.sendErr("Invalid Subject")
@@ -457,7 +480,17 @@ func (c *client) processSub(argo []byte) (err error) {
 		c.sendOK()
 	}
 	if shouldForward {
-		c.srv.broadcastSubscribe(sub)
+		err = c.srv.broadcastSubscribe(sub)
+			if err != nil {
+				c.sendErr("broadcast subscribe failed.")
+			}
+	}
+	
+	ip, port := c.ConnStr()
+	if err != nil {
+		Logf("[%s:%s] subscribe [%s] failed.", ip, port , sub.subject)
+	} else {
+		Logf("[%s:%s] subscribe [%s] success.", ip, port , sub.subject)
 	}
 	return nil
 }
@@ -500,14 +533,35 @@ func (c *client) processUnsub(arg []byte) error {
 			sub.max = 0
 		}
 		c.unsubscribe(sub)
-		if shouldForward := c.typ != ROUTER && c.srv != nil; shouldForward {
-			c.srv.broadcastUnSubscribe(sub)
+		
+		r := c.srv.sl.Match(sub.subject)
+		hasSub := false
+		for _, v := range r {
+			sub := v.(*subscription)
+			if sub.client.typ != ROUTER {
+				hasSub = true
+				break
+			}
+		}
+		
+		ip, port := c.ConnStr()
+		if shouldForward := c.typ != ROUTER && c.srv != nil && (!hasSub || sub.queue != nil); shouldForward {
+			err := c.srv.broadcastUnSubscribe(sub)
+			if err != nil {
+				c.sendErr("broadcast unsubscribe failed.")
+				Logf("[%s:%s] unsubscribe [%s] failed.",ip, port , sub.subject)
+			} else {
+				Logf("[%s:%s] unsubscribe [%s] success.",ip, port , sub.subject)
+			}
+		} else {
+			Logf("[%s:%s] unsubscribe [%s] success.",ip, port , sub.subject)
 		}
 	}
+	
 	if c.opts.Verbose {
 		c.sendOK()
 	}
-
+	
 	return nil
 }
 
@@ -603,18 +657,17 @@ writeErr:
 		Log("Slow Consumer Detected", clientConnStr(client.nc), client.cid)
 		client.closeConnection()
 	} else {
-		Debugf("Error writing msg: %v", err)
+		Logf("Error writing msg: %v", err)
+		//fix me, why close.
+		client.closeConnection()
 	}
 }
 
 // processMsg is called to process an inbound msg from a client.
 func (c *client) processMsg(msg []byte) {
-
 	// Update statistics
-
 	// The msg includes the CR_LF, so pull back out for accounting.
 	msgSize := int64(len(msg) - LEN_CR_LF)
-
 	c.inMsgs++
 	c.inBytes += msgSize
 
@@ -658,18 +711,18 @@ func (c *client) processMsg(msg []byte) {
 	// If we are a route and we have a queue subscription, deliver direct
 	// since they are sent direct via L2 semantics.
 	if isRoute {
-		if sub := srv.routeSidQueueSubscriber(c.pa.sid); sub != nil {
-			mh := c.msgHeader(msgh[:si], sub)
-			c.deliverMsg(sub, mh, msg)
+		if sub, ok := srv.routeSidQueueSubscriber(c.pa.sid); ok {
+			if sub != nil {
+				mh := c.msgHeader(msgh[:si], sub)
+				c.deliverMsg(sub, mh, msg)
+			}
 			return
 		}
 	}
 
 	// Loop over all subscriptions that match.
-
 	for _, v := range r {
 		sub := v.(*subscription)
-
 		// Process queue group subscriptions by gathering them all up
 		// here. We will pick the winners when we are done processing
 		// all of the subscriptions.
@@ -701,16 +754,15 @@ func (c *client) processMsg(msg []byte) {
 			// Skip if sourced from a ROUTER and going to another ROUTER.
 			// This is 1-Hop semantics for ROUTERs.
 			if isRoute {
+				// 转发的消息不应该再次转发到另外一个服务器
 				continue
 			}
 			// Check to see if we have already sent it here.
 			if rmap == nil {
-				rmap = make(map[string]struct{}, srv.numRoutes())
+				rmap = make(map[string]struct{}, srv.NumRoutes())
 			}
-			if sub.client == nil || sub.client.route == nil ||
-				sub.client.route.remoteID == "" {
-				Debug("Bad or Missing ROUTER Identity, not processing msg",
-					clientConnStr(c.nc), c.cid)
+			if sub.client == nil || sub.client.route == nil || sub.client.route.remoteID == "" {
+				Debug("Bad or Missing ROUTER Identity, not processing msg", clientConnStr(c.nc), c.cid)
 				continue
 			}
 			if _, ok := rmap[sub.client.route.remoteID]; ok {
@@ -718,6 +770,7 @@ func (c *client) processMsg(msg []byte) {
 				continue
 			}
 			rmap[sub.client.route.remoteID] = routeSeen
+			Logf("forward publish [%s] to other router. remoteID: [%s]", c.pa.subject, sub.client.route.remoteID)
 		}
 
 		mh := c.msgHeader(msgh[:si], sub)
@@ -836,7 +889,7 @@ func (c *client) closeConnection() {
 
 	// FIXME(dlc) - This creates garbage for no reason.
 	dbgString := fmt.Sprintf("%s connection closed", c.typeString())
-	Debug(dbgString, clientConnStr(c.nc), c.cid)
+	Log(dbgString, clientConnStr(c.nc), c.cid)
 
 	c.clearAuthTimer()
 	c.clearPingTimer()
@@ -854,22 +907,24 @@ func (c *client) closeConnection() {
 
 		// Remove clients subscriptions.
 		for _, s := range subs {
-			if sub, ok := s.(*subscription); ok {
+			sub, ok := s.(*subscription)
+			if ok {
 				srv.sl.Remove(sub.subject, sub)
+				hasSub := false
+				r := srv.sl.Match(sub.subject)
+				for _, v := range r {
+					slSub := v.(*subscription)
+					if slSub.client.typ != ROUTER {
+						hasSub = true
+						break
+					}
+				}
+				
+				if c.typ == CLIENT && (!hasSub || sub.queue != nil) {
+					Logf("last subscribe[%s], need to broadcastUnSubscribe.", sub.subject)
+					srv.broadcastUnSubscribe(sub)
+				}
 			}
-		}
-	}
-
-	// Check for a solicited route. If it was, start up a reconnect unless
-	// we are already connected to the other end.
-	if c.isSolicitedRoute() {
-		rid := c.route.remoteID
-		if rid != "" && c.srv.remotes[rid] != nil {
-			Debug("Not attempting reconnect for solicited route, already connected.", rid)
-			return
-		} else {
-			Debug("Attempting reconnect for solicited route", c.cid)
-			go srv.reConnectToRoute(c.route.url)
 		}
 	}
 }

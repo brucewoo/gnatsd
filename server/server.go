@@ -10,14 +10,18 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"strconv"
 	"sync"
 	"time"
+	"runtime"
+	"errors"
 
 	// Allow dynamic profiling.
 	_ "net/http/pprof"
 
 	"github.com/apcera/gnatsd/sublist"
+	"github.com/apcera/gnatsd/zk"
 )
 
 // Info is the information sent to clients to help them understand information
@@ -57,6 +61,8 @@ type Server struct {
 	routeInfo     Info
 	routeInfoJSON []byte
 	rcQuit        chan bool
+	
+	zkClient	  *zk.ZkClient
 }
 
 type stats struct {
@@ -172,7 +178,12 @@ func (s *Server) logPid() {
 // Start up the server, this will block.
 // Start via a Go routine if needed.
 func (s *Server) Start() {
-
+	// setup number of procs
+	if s.opts.MaxProcs != 0 {
+		Logf("set go max runtime processes [%d].", s.opts.MaxProcs)
+		runtime.GOMAXPROCS(s.opts.MaxProcs)
+	}
+	
 	// Log the pid to a file
 	if s.opts.PidFile != _EMPTY_ {
 		s.logPid()
@@ -184,8 +195,16 @@ func (s *Server) Start() {
 	}
 
 	// Start up routing as well if needed.
-	if s.opts.ClusterPort != 0 {
+	if len(s.opts.ZkAddrs) > 0 && s.opts.ZkPath != "" {
 		s.StartRouting()
+		err := s.ConnectOtherServer()
+		if err != nil {
+			Fatal("Connect Other Server is failed: ", err)
+		}
+		err = s.RegisterToZk()
+		if err != nil {
+			Fatal("register to zk is failed: ", err)
+		}
 	}
 
 	// Pprof http endpoint for the profiler.
@@ -195,6 +214,203 @@ func (s *Server) Start() {
 
 	// Wait for clients.
 	s.AcceptLoop()
+}
+
+func (s *Server) ConnectOtherServer() error {
+	if s.zkClient == nil {
+		c, _, _ := zk.Connect(s.opts.ZkAddrs, secondsToDuration(s.opts.ZkTimeout))
+		count := 0
+		connected := false
+		for {
+			if c.State() != zk.StateConnected && c.State() != zk.StateHasSession {
+				if count < 5 {
+					Logf("wait connection zookeeper : %s", s.opts.ZkPath)
+					count++
+					time.Sleep(time.Second)
+				} else {
+					break
+				}
+			} else {
+				connected = true
+				break
+			}
+		}
+		
+		if connected {
+			s.zkClient = c
+		} else {
+			c.Close()
+			return errors.New("connect to zookeeper is failed.")
+		}
+	}	
+			
+	b, _,  err := s.zkClient.Exists(s.opts.ZkPath)
+	if err != nil {
+		Logf("zkclient Exists [%s] failed: %s", s.opts.ZkPath, err)
+		return err
+	}
+			
+	if b {
+		nodes, _, err := s.zkClient.Children(s.opts.ZkPath)
+		if err != nil {
+			Logf("from zookeeper get other gnatsd failed: %s,%s", s.opts.ZkPath, err)
+			return err
+		} 
+
+		host, err := zk.LocalIP()
+		if err != nil {
+			Logf("zkclient LocalIP failed.")
+			return err
+		}
+	
+		myself := host + "-" + strconv.Itoa(s.opts.Port) + "-" + strconv.Itoa(s.opts.RoutePort)
+		
+		for _, node := range nodes {
+			// 防止重新启动的时候zk上以前的注册信息没有消息而产生连接自己的错误
+			if !strings.Contains(node, myself) {
+				s.connectToRoute(node)
+			}
+		}
+	}
+	
+	return nil
+}
+
+//register addr to zk
+func (s *Server) RegisterToZk() error {
+	paths := strings.Split(s.opts.ZkPath, "/")
+	tmp := ""
+	for _, p := range paths {
+		strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		
+		tmp = tmp + "/" + p
+		b, _,  err := s.zkClient.Exists(tmp)
+		if err != nil {
+			Logf("RegisterToZk:zkclient Exists [%s] failed.", tmp)
+			return err
+		}
+		
+		if !b {
+			_, err := s.zkClient.Create(tmp, []byte{0}, 0, zk.WorldACL(zk.PermAll))
+			if err != nil {
+				Logf("RegisterToZk:zkclient Create [%s] failed.", tmp)
+				return err
+			}
+		}
+	}
+		
+	host,err := zk.LocalIP()
+	if err != nil {
+		Logf("RegisterToZk: zkclient LocalIP failed.")
+		return err
+	}
+	nodepath := s.opts.ZkPath + "/" + s.opts.Username + ":" + s.opts.Password
+	nodepath += "@" + host + "-" + strconv.Itoa(s.opts.Port)
+	if s.opts.RoutePort != 0 {
+		 nodepath +=  "-" + strconv.Itoa(s.opts.RoutePort)
+	} else {
+		Logf("RegisterToZk: route port isn't config right.")
+		return errors.New("route port isn't config right.")
+	}
+	
+	b, _,  err := s.zkClient.Exists(nodepath)
+	if err != nil {
+		Logf("RegisterToZk: zkclient Exists [%s] failed.", nodepath)
+		return err
+	}
+		
+	if b {
+		err := s.zkClient.Delete(nodepath, 0)
+		if err != nil {
+			Logf("RegisterToZk: zkclient delete [%s] failed, %s.", nodepath, err)
+			return err
+		}
+	}
+		
+	path, err := s.zkClient.Create(nodepath, []byte("0"), zk.FlagEphemeral, zk.WorldACL(zk.PermAll))
+	if err != nil {
+		Logf("RegisterToZk : zkclient Create [%s] failed. %s.", nodepath, err)
+		return err
+	}
+	go s.checkHeartNode(nodepath)
+	Logf("success register to zk : %s", path)
+	return nil
+}
+
+// 1.每隔一秒检测一次临时节点是否存在，不存在就创建
+// 2.获取其他nats服务段节点，判断是否都建立了连接，如果没有需要重新建立连接来同步订阅信息
+func (s *Server) checkHeartNode(nodepath string) {
+	for s.isRunning() {
+		b, _,  err := s.zkClient.Exists(nodepath)
+		if err != nil {
+			Logf("checkHeartNode： zkclient Exists [%s] failed， %s.", nodepath, err)
+		} else if !b {
+			Logf("checkHeartNode: [%s] is not exist, need to recreate.", nodepath)
+			_, err := s.zkClient.Create(nodepath, []byte{0}, zk.FlagEphemeral, zk.WorldACL(zk.PermAll))
+			if err != nil {
+				Logf("checkHeartNode: zkclient Create [%s] failed, %s.", nodepath, err)
+			}
+		}
+		
+		nodes, _, err := s.zkClient.Children(s.opts.ZkPath)
+		if err != nil {
+			Logf("from zookeeper get other gnatsd failed: %s,%s", s.opts.ZkPath, err)
+		} else {
+			Logf("route client [%d], zk's nodes[%d]", s.NumRoutes()+1, len(nodes))
+			host, err := zk.LocalIP()
+			if err != nil {
+				Logf("zkclient LocalIP failed.")
+				time.Sleep(1 * time.Second)
+				continue
+			}
+			myself := host + "-" + strconv.Itoa(s.opts.Port) + "-" + strconv.Itoa(s.opts.RoutePort)
+			s.mu.Lock()
+			routes := s.routes
+			s.mu.Unlock()
+
+			for _, node := range nodes {
+				if !strings.Contains(node, myself) {
+					find := false
+					for _, route := range routes {
+						ip, _ := route.ConnStr()
+						if len(ip) < 8 {
+							continue
+						}
+						if strings.Contains(node, ip) {
+							Logf("find route client ip : %s, cid : %d, remoteID: %s", ip, route.cid, route.route.remoteID)
+							find = true
+							break
+						}
+					}
+					
+					if !find {
+						Logf("has not find route client [%s]", node)
+						s.connectToRoute(node)
+					}
+				}
+			}
+			
+			if  (s.NumRoutes()+1) > len(nodes){
+				for _, route := range routes {
+					ip, _ := route.ConnStr()
+					if len(ip) < 8 {
+						Logf("ip address is not right, delete this route[%d]", route.cid)
+						s.removeClient(route)
+						s.mu.Lock()
+						routes = s.routes
+						s.mu.Unlock()
+					}
+				}
+			}
+		}
+		
+		time.Sleep(10 * time.Second)
+	}
+	
+	Logf("checkHeartNode exit...")
 }
 
 // Shutdown will shutdown the server instance by kicking out the AcceptLoop
@@ -209,7 +425,11 @@ func (s *Server) Shutdown() {
 	}
 
 	s.running = false
-
+	
+	// close zk connection
+	if s.zkClient != nil {
+		s.zkClient.Close()
+	}
 	// Copy off the clients
 	clients := make(map[uint64]*client)
 	for i, c := range s.clients {
@@ -280,7 +500,7 @@ func (s *Server) AcceptLoop() {
 		conn, err := l.Accept()
 		if err != nil {
 			if ne, ok := err.(net.Error); ok && ne.Temporary() {
-				Debug("Temporary Client Accept Error(%v), sleeping %dms",
+				Logf("Temporary Client Accept Error(%v), sleeping %dms",
 					ne, tmpDelay/time.Millisecond)
 				time.Sleep(tmpDelay)
 				tmpDelay *= 2
@@ -327,6 +547,9 @@ func (s *Server) StartHTTPMonitoring() {
 
 	// Connz
 	mux.HandleFunc("/connz", s.HandleConnz)
+	
+	// Subz
+	mux.HandleFunc("/subz", s.HandleSubz)
 
 	srv := &http.Server{
 		Addr:           hp,
@@ -346,7 +569,7 @@ func (s *Server) StartHTTPMonitoring() {
 }
 
 func (s *Server) createClient(conn net.Conn) *client {
-	c := &client{srv: s, nc: conn, opts: defaultOpts}
+	c := &client{srv: s, nc: conn, typ: CLIENT, opts: defaultOpts}
 
 	// Grab lock
 	c.mu.Lock()
@@ -354,7 +577,7 @@ func (s *Server) createClient(conn net.Conn) *client {
 	// Initialize
 	c.initClient()
 
-	Debug("Client connection created", clientConnStr(c.nc), c.cid)
+	Logf("Client connection created", clientConnStr(c.nc), c.cid)
 
 	// Send our information.
 	s.sendInfo(c)
@@ -405,8 +628,8 @@ func (s *Server) checkRouterAuth(c *client) bool {
 	if !s.routeInfo.AuthRequired {
 		return true
 	}
-	if s.opts.ClusterUsername != c.opts.Username ||
-		s.opts.ClusterPassword != c.opts.Password {
+	if s.opts.Username != c.opts.Username ||
+		s.opts.Password != c.opts.Password {
 		return false
 	}
 	return true
@@ -438,7 +661,11 @@ func (s *Server) removeClient(c *client) {
 	case ROUTER:
 		delete(s.routes, cid)
 		if c.route != nil {
-			delete(s.remotes, c.route.remoteID)
+			rc, ok := s.remotes[c.route.remoteID]
+			// Only delete it if it is us..
+			if ok && c == rc {
+				delete(s.remotes, c.route.remoteID)
+			}
 		}
 	}
 	s.mu.Unlock()
@@ -467,4 +694,12 @@ func (s *Server) NumClients() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return len(s.clients)
+}
+
+// NumSubscriptions will report how many subscriptions are active.
+func (s *Server) NumSubscriptions() uint32 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	stats := s.sl.Stats()
+	return stats.NumSubs
 }

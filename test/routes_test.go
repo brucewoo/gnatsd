@@ -10,8 +10,10 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"net/url"
 
 	"github.com/apcera/gnatsd/server"
+	"github.com/apcera/gnatsd/zk"
 )
 
 func runRouteServer(t *testing.T) (*server.Server, *server.Options) {
@@ -34,7 +36,7 @@ func TestRouterListeningSocket(t *testing.T) {
 	defer s.Shutdown()
 
 	// Check that the cluster socket is able to be connected.
-	addr := fmt.Sprintf("%s:%d", opts.ClusterHost, opts.ClusterPort)
+	addr := fmt.Sprintf("%s:%d", opts.RouteHost, opts.RoutePort)
 	checkSocket(t, addr, 2*time.Second)
 }
 
@@ -52,10 +54,14 @@ func TestRouteGoServerShutdown(t *testing.T) {
 func TestSendRouteInfoOnConnect(t *testing.T) {
 	s, opts := runRouteServer(t)
 	defer s.Shutdown()
-	rc := createRouteConn(t, opts.ClusterHost, opts.ClusterPort)
+	rc := createRouteConn(t, opts.RouteHost, opts.RoutePort)
 	routeSend, routeExpect := setupRoute(t, rc, opts)
-	buf := routeExpect(infoRe)
-
+	
+	buf := routeExpect(connectRe)
+	t.Log(string(buf))
+	
+	buf = routeExpect(infoRe)
+	t.Log(string(buf))
 	info := server.Info{}
 	if err := json.Unmarshal(buf[4:], &info); err != nil {
 		t.Fatalf("Could not unmarshal route info: %v", err)
@@ -64,9 +70,9 @@ func TestSendRouteInfoOnConnect(t *testing.T) {
 	if !info.AuthRequired {
 		t.Fatal("Expected to see AuthRequired")
 	}
-	if info.Port != opts.ClusterPort {
+	if info.Port != opts.RoutePort {
 		t.Fatalf("Received wrong information for port, expected %d, got %d",
-			info.Port, opts.ClusterPort)
+			info.Port, opts.RoutePort)
 	}
 
 	// Now send it back and make sure it is processed correctly inbound.
@@ -85,7 +91,9 @@ func TestSendRouteSubAndUnsub(t *testing.T) {
 	send, _ := setupConn(t, c)
 
 	// We connect to the route.
-	rc := createRouteConn(t, opts.ClusterHost, opts.ClusterPort)
+	rc := createRouteConn(t, opts.RouteHost, opts.RoutePort)
+	buf := expectResult(t, c, infoRe)
+	t.Log(string(buf))
 	expectAuthRequired(t, rc)
 	setupRoute(t, rc, opts)
 
@@ -93,7 +101,7 @@ func TestSendRouteSubAndUnsub(t *testing.T) {
 	send("SUB foo 22\r\n")
 
 	// Make sure the SUB is broadcast via the route
-	buf := expectResult(t, rc, subRe)
+	buf = expectResult(t, rc, subRe)
 	matches := subRe.FindAllSubmatch(buf, -1)
 	rsid := string(matches[0][5])
 	if !strings.HasPrefix(rsid, "RSID:") {
@@ -113,29 +121,6 @@ func TestSendRouteSubAndUnsub(t *testing.T) {
 	}
 }
 
-func TestSendRouteSolicit(t *testing.T) {
-	s, opts := runRouteServer(t)
-	defer s.Shutdown()
-
-	// Listen for a connection from the server on the first route.
-	if len(opts.Routes) <= 0 {
-		t.Fatalf("Need an outbound solicted route for this test")
-	}
-	rUrl := opts.Routes[0]
-
-	conn := acceptRouteConn(t, rUrl.Host, server.DEFAULT_ROUTE_CONNECT)
-	defer conn.Close()
-
-	// We should receive a connect message right away due to auth.
-	buf := expectResult(t, conn, connectRe)
-
-	// Check INFO follows. Could be inline, with first result, if not
-	// check follow-on buffer.
-	if !infoRe.Match(buf) {
-		expectResult(t, conn, infoRe)
-	}
-}
-
 func TestRouteForwardsMsgFromClients(t *testing.T) {
 	s, opts := runRouteServer(t)
 	defer s.Shutdown()
@@ -145,7 +130,13 @@ func TestRouteForwardsMsgFromClients(t *testing.T) {
 
 	clientSend, clientExpect := setupConn(t, client)
 
-	route := acceptRouteConn(t, opts.Routes[0].Host, server.DEFAULT_ROUTE_CONNECT)
+	c, _, _ := zk.Connect(opts.ZkAddrs, time.Second)
+	nodes, _, _ := c.Children(opts.ZkPath)
+	tmps := strings.Split(nodes[0], "-")
+	routeURL := "nats-route://" + tmps[0] + ":" + tmps[2]
+	rUrl, _ := url.Parse(routeURL)
+	
+	route := acceptRouteConn(t, rUrl.Host, server.DEFAULT_ROUTE_CONNECT)
 	defer route.Close()
 
 	routeSend, routeExpect := setupRoute(t, route, opts)
@@ -178,10 +169,10 @@ func TestRouteForwardsMsgToClients(t *testing.T) {
 	clientSend, clientExpect := setupConn(t, client)
 	expectMsgs := expectMsgsCommand(t, clientExpect)
 
-	route := createRouteConn(t, opts.ClusterHost, opts.ClusterPort)
+	route := createRouteConn(t, opts.RouteHost, opts.RoutePort)
+	routeSend, routeExpect := setupRoute(t, route, opts)
+	routeExpect(connectRe)
 	expectAuthRequired(t, route)
-	routeSend, _ := setupRoute(t, route, opts)
-
 	// Subscribe to foo
 	clientSend("SUB foo 1\r\n")
 	// Use ping roundtrip to make sure its processed.
@@ -199,7 +190,7 @@ func TestRouteOneHopSemantics(t *testing.T) {
 	s, opts := runRouteServer(t)
 	defer s.Shutdown()
 
-	route := createRouteConn(t, opts.ClusterHost, opts.ClusterPort)
+	route := createRouteConn(t, opts.RouteHost, opts.RoutePort)
 	expectAuthRequired(t, route)
 	routeSend, _ := setupRoute(t, route, opts)
 
@@ -222,7 +213,7 @@ func TestRouteOnlySendOnce(t *testing.T) {
 
 	clientSend, clientExpect := setupConn(t, client)
 
-	route := createRouteConn(t, opts.ClusterHost, opts.ClusterPort)
+	route := createRouteConn(t, opts.RouteHost, opts.RoutePort)
 	expectAuthRequired(t, route)
 	routeSend, routeExpect := setupRoute(t, route, opts)
 	expectMsgs := expectMsgsCommand(t, routeExpect)
@@ -252,7 +243,7 @@ func TestRouteQueueSemantics(t *testing.T) {
 
 	defer client.Close()
 
-	route := createRouteConn(t, opts.ClusterHost, opts.ClusterPort)
+	route := createRouteConn(t, opts.RouteHost, opts.RoutePort)
 	expectAuthRequired(t, route)
 	routeSend, routeExpect := setupRoute(t, route, opts)
 	expectMsgs := expectMsgsCommand(t, routeExpect)
@@ -336,7 +327,11 @@ func TestSolicitRouteReconnect(t *testing.T) {
 	s, opts := runRouteServer(t)
 	defer s.Shutdown()
 
-	rUrl := opts.Routes[0]
+	c, _, _ := zk.Connect(opts.ZkAddrs, time.Second)
+	nodes, _, _ := c.Children(opts.ZkPath)
+	tmps := strings.Split(nodes[0], "-")
+	routeURL := "nats-route://" + tmps[0] + ":" + tmps[2]
+	rUrl, _ := url.Parse(routeURL)
 
 	route := acceptRouteConn(t, rUrl.Host, server.DEFAULT_ROUTE_CONNECT)
 
@@ -351,11 +346,11 @@ func TestMultipleRoutesSameId(t *testing.T) {
 	s, opts := runRouteServer(t)
 	defer s.Shutdown()
 
-	route1 := createRouteConn(t, opts.ClusterHost, opts.ClusterPort)
+	route1 := createRouteConn(t, opts.RouteHost, opts.RoutePort)
 	expectAuthRequired(t, route1)
 	route1Send, _ := setupRouteEx(t, route1, opts, "ROUTE:2222")
 
-	route2 := createRouteConn(t, opts.ClusterHost, opts.ClusterPort)
+	route2 := createRouteConn(t, opts.RouteHost, opts.RoutePort)
 	expectAuthRequired(t, route2)
 	route2Send, _ := setupRouteEx(t, route2, opts, "ROUTE:2222")
 
@@ -414,18 +409,81 @@ func TestRouteResendsLocalSubsOnReconnect(t *testing.T) {
 	clientSend("PING\r\n")
 	clientExpect(pongRe)
 
-	route := createRouteConn(t, opts.ClusterHost, opts.ClusterPort)
-	_, routeExpect := setupRouteEx(t, route, opts, "ROUTE:4222")
+	route := createRouteConn(t, opts.RouteHost, opts.RoutePort)
+	routeSend, routeExpect := setupRouteEx(t, route, opts, "ROUTE:4222")
 
 	// Expect to see the local sub echoed through.
+	buf := routeExpect(infoRe)
+	
+	// Generate our own so we can send one to trigger the local subs.
+	info := server.Info{}
+	if err := json.Unmarshal(buf[4:], &info); err != nil {
+		t.Fatalf("Could not unmarshal route info: %v", err)
+	}
+	info.ID = "ROUTE:4222"
+	b, err := json.Marshal(info)
+	if err != nil {
+		t.Fatalf("Could not marshal test route info: %v", err)
+	}
+	infoJson := fmt.Sprintf("INFO %s\r\n", b)
+
+	routeSend(infoJson)
 	routeExpect(subRe)
 
 	// Close and re-open
 	route.Close()
 
-	route = createRouteConn(t, opts.ClusterHost, opts.ClusterPort)
-	_, routeExpect = setupRouteEx(t, route, opts, "ROUTE:4222")
+	route = createRouteConn(t, opts.RouteHost, opts.RoutePort)
+	routeSend, routeExpect = setupRouteEx(t, route, opts, "ROUTE:4222")
 
-	// Expect to see the local sub echoed through.
+	// Expect to see the local sub echoed through after info.
+	routeExpect(infoRe)
+	routeSend(infoJson)
 	routeExpect(subRe)
+}
+
+
+// This will check that the matches include at least one of the sids. Useful for checking
+// that we received messages on a certain queue group.
+func checkForQueueSid(t tLogger, matches [][][]byte, sids []string) {
+	seen := make(map[string]int, len(sids))
+	for _, sid := range sids {
+		seen[sid] = 0
+	}
+	for _, m := range matches {
+		sid := string(m[SID_INDEX])
+		if _, ok := seen[sid]; ok {
+			seen[sid] += 1
+		}
+	}
+	// Make sure we only see one and exactly one.
+	total := 0
+	for _, n := range seen {
+		total += n
+	}
+	if total != 1 {
+		stackFatalf(t, "Did not get a msg for queue sids group: expected 1 got %d\n", total)
+	}
+}
+
+// This will check that the matches include all of the sids. Useful for checking
+// that we received messages on all subscribers.
+func checkForPubSids(t tLogger, matches [][][]byte, sids []string) {
+	seen := make(map[string]int, len(sids))
+	for _, sid := range sids {
+		seen[sid] = 0
+	}
+	for _, m := range matches {
+		sid := string(m[SID_INDEX])
+		if _, ok := seen[sid]; ok {
+			seen[sid] += 1
+		}
+	}
+	// Make sure we only see one and exactly one for each sid.
+	for sid, n := range seen {
+		if n != 1 {
+			stackFatalf(t, "Did not get a msg for sid[%s]: expected 1 got %d\n", sid, n)
+
+		}
+	}
 }

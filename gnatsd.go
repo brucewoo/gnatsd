@@ -5,11 +5,19 @@ package main
 import (
 	"flag"
 	"strings"
-
+	"syscall"
+	"fmt"
 	"github.com/apcera/gnatsd/server"
 )
 
 func main() {
+	rlimit := &syscall.Rlimit{65535, 65535}
+	err := syscall.Setrlimit(syscall.RLIMIT_NOFILE, rlimit)
+	if err != nil {
+		fmt.Printf("Setrlimit failed, exit.")
+		return
+	}
+	
 	// logging setup
 	server.LogSetup()
 
@@ -81,10 +89,10 @@ func main() {
 		}
 		opts = *server.MergeOptions(fileOpts, &opts)
 	}
-
+	
 	// Create the server with appropriate options.
 	s := server.New(&opts)
-
+	
 	// Start things up. Block here until done.
 	s.Start()
 }

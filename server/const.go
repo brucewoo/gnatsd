@@ -77,4 +77,7 @@ const (
 
 	// MAX_PUB_ARGS Maximum possible number of arguments from PUB proto.
 	MAX_PUB_ARGS = 3
+	
+	// DEFAULT_MAX_PROCS Maximum runtime process.
+	DEFAULT_MAX_PROCS = 4
 )
